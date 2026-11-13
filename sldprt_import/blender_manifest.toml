@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "sldprt_import"
+version = "0.1.4"
+name = "SLDPRT Import"
+tagline = "Open .sldprt part files in Blender from their exact geometry"
+maintainer = "Ely"
+website = "https://github.com/Elyh29/sldprt-import"
+type = "add-on"
+tags = ["Import-Export"]
+
+blender_version_min = "4.3.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Ely"]
+
+[permissions]
+files = "Read the .sldprt files you import"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", ".*"]

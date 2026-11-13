@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+*.sldprt
+*.SLDPRT
+*.sldasm
+*.SLDASM

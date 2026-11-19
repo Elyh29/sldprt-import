@@ -9,7 +9,8 @@ Open `.sldprt` part files in Blender, without the CAD software that made them.
 - **Exact Geometry** (default): the part's real surfaces (planes, cylinders, cones, spheres, tori, B-splines, fillets, swept and revolved surfaces) are read from the file and meshed at the tolerance you choose. Smaller tolerance, more triangles.
   - One object per body, under an empty named after the file.
   - Normals taken from the true surface: round faces shade smoothly, edges between faces stay crisp.
-  - Bodies hidden in the original file are imported hidden (`(hidden)` in their name).
+  - Bodies hidden in the original file are imported hidden (`(hidden)` in their name). **Hidden Bodies** chooses how they are meshed: coarsely (default, faster), at the full tolerance, or left out.
+  - Blender stays responsive while a large part is meshed: each body appears as soon as it is done, the progress shows in the status bar, and **Esc** stops the import and keeps the bodies already made.
 - **Display Mesh**: the light mesh stored in the file for previews. Fast, with four detail levels (Coarse, As Saved, Fine, Very Fine).
 - **Keep CAD Faces**: stores the CAD face of each triangle in the `cad_face` attribute, handy to select a whole face.
 - Several files at once; nothing to install besides the add-on.

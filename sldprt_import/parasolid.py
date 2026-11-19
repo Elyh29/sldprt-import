@@ -4,6 +4,7 @@
 Decoded on 12/11/2026 from a real part: big-endian; each node = type (2 bytes), at the first node of a type a schema mark
 (0xff = as the base schema, else n + change codes C/D/I/A + 'Z'), a length (4 bytes) for variable nodes, its index (2 bytes),
 then its fields. Pointers are indexes (2 bytes), 1 = none. Doubles -3.14158e13 = unset."""
+import re
 import struct
 import zlib
 
@@ -92,6 +93,8 @@ LAYOUT = {
     80: "ppd" + "c" * 24,     # ATTRIB_DEF (+ field types)
     81: "dpppppp",            # ATTRIBUTE (+ field pointers)
     82: "", 83: "", 84: "",   # int / real / char values
+    85: "", 86: "", 87: "", 88: "", 89: "", 98: "",   # point / vector / direction / axis / tag / unicode values (attributes)
+    100: "dppp" + "f" * 9 + "vfdfff",   # TRANSFORM  id, owner, next, prev, rotation (9), translation, scale, flag, 3 unset
     101: "pppppppcppddpdpp",  # PARTITION (racine)
     124: "dpppppcpp",         # B_SURFACE …, nurbs, data
     125: "f" * 8 + "c" * 13 + "pppp",   # SURFACE_DATA
@@ -105,7 +108,9 @@ LAYOUT = {
     141: "pppp",              # GEOMETRIC_OWNER
 }
 # nœuds de longueur variable : type de leurs éléments
-VAR = {40: "v", 41: "v", 45: "f", 74: "p", 79: "c", 80: "c", 81: "p", 82: "d", 83: "f", 84: "c", 127: "n", 128: "f"}
+VAR = {40: "v", 41: "v", 45: "f", 74: "p", 79: "c", 80: "c", 81: "p", 82: "d", 83: "f", 84: "c", 85: "v", 86: "v", 87: "v", 88: "a",
+       89: "d", 98: "n", 127: "n", 128: "f"}
+_ELT = {"v": 24, "f": 8, "c": 1, "d": 4, "n": 2, "a": 48}   # bytes of one element of a variable node
 SIZES = LAYOUT   # compatibilité
 _SZ = {"d": 4, "f": 8, "c": 1, "n": 2, "v": 24}
 _FMT = {"d": ">i", "f": ">d", "c": ">c", "n": ">h", "v": ">3d"}
@@ -138,19 +143,163 @@ def partition_stream(path, config=0):
     return data
 
 
-def _schema(x, q):
+def body_streams(path, config=0):
+    """[(name, stream)] of the bodies a part keeps per feature (newer files, imported bodies): each one a compressed Parasolid
+    transmit file, after the UTF-16 name of its feature. Empty when the file has none."""
+    with open(path, "rb") as f:
+        secs = sections(f.read())
+    raw = secs.get(f"Config-{config}-FeatureBodies/LocalBodies") or b""
+    out, i = [], 0
+    while True:
+        z = _ZLIB.search(raw, i)
+        if not z:
+            return out
+        p = z.start()
+        try:
+            o = zlib.decompressobj()
+            data = o.decompress(raw[p:])
+        except zlib.error:
+            i = p + 1
+            continue
+        if not (o.eof and data.startswith(b"PS")):
+            i = p + 1
+            continue
+        names = _NAME.findall(raw[max(0, p - 120):p])
+        i = len(raw) - len(o.unused_data)
+        # gros corps : blocs [taille décompressée (4), taille compressée (4), zlib] à la suite, comme la partition
+        if p >= 8 and struct.unpack_from("<I", raw, p - 8)[0] == len(data):
+            parts = [data]
+            while i + 8 <= len(raw):
+                usize, csize = struct.unpack_from("<II", raw, i)
+                if not usize or not csize or i + 8 + csize > len(raw):
+                    break
+                try:
+                    more = zlib.decompress(raw[i + 8:i + 8 + csize])
+                except zlib.error:
+                    break
+                if len(more) != usize or more.startswith(b"PS"):
+                    break
+                parts.append(more)
+                i += 8 + csize
+            data = b"".join(parts)
+        out.append((names[-1].decode("utf-16-le") if names else f"Body {len(out) + 1}", data))
+
+
+_ZLIB = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
+_NAME = re.compile(rb"(?:[\x20-\x7e]\x00){2,}")
+
+
+# Schema marks of the node types that differ from the base schema (13006) in the streams the table LAYOUT was written for
+# (modeller 28): C = field of the base schema kept, D = dropped, a name = field added. Any other stream gives its own marks:
+# its fields are read with them and put back in the LAYOUT order, so the rest of the reader does not depend on the version.
+V28 = {
+    12: "C C C C C C C C C C C C C D owner C C C C C C C C C boundary_mesh index_map_offset index_map node_id_index_map "
+        "schema_embedding_map child lowest_node_id",
+    19: "C C C C C C C owner",
+    41: "C term_use C",
+    70: "C list_type notransmit C C C D C C D finger_index finger_block C",
+    74: "C index_map_offset C C",
+    101: "C C C C C C C C C attdef_list C C mesh index_map_offset index_map schema_embedding_map",
+}
+_KINDS = {"p": "p", "d": "d", "f": "f", "c": "c", "u": "c", "l": "c", "n": "n", "w": "n", "v": "v", "h": "v", "i": "ff", "b": "ffffff"}
+_DEFAULT = {"p": 1, "d": 0, "f": 0.0, "c": b"\x00", "n": 0, "v": (0.0, 0.0, 0.0)}
+
+
+def _mark(x, q):
+    """Schema mark at the first node of a type: (tokens, next offset); tokens = None (as the base schema) or a list of
+    'C', 'D' and (name, kinds, count) for an added field."""
     if x[q] == 0xFF:
-        return q + 1
+        return None, q + 1
     q += 1
+    out = []
     while True:
         c = chr(x[q]); q += 1
         if c == "Z":
-            return q
+            return out, q
         if c in "IA":
-            q += 1 + x[q]
-            cls = struct.unpack_from(">H", x, q)[0]; q += 4
+            n = x[q]; name = x[q + 1:q + 1 + n].decode("latin1"); q += 1 + n
+            cls, count = struct.unpack_from(">HH", x, q); q += 4
+            kind = "p"
             if cls == 0:
-                q += 1 + x[q]
+                n = x[q]; kind = x[q + 1:q + 1 + n].decode("latin1"); q += 1 + n
+            out.append((name, kind, count))
+        elif c in "CD":
+            out.append(c)
+        else:
+            raise FormatError("Parasolid schema mark not understood")
+
+
+def _declare(x, q):
+    """Full description of a node type at its first node: ((kinds of its fixed fields, kind of its variable part or ""), next
+    offset). Layout: number of fields, name, title, then per field its name, class, count and (class 0) its kind; one byte
+    tells whether the last field has a variable length."""
+    nf = x[q]; q += 1
+    for _ in range(2):   # name and title
+        q += 1 + x[q]
+    kinds = []
+    for _ in range(nf):
+        q += 1 + x[q]
+        cls, count = struct.unpack_from(">HH", x, q); q += 4
+        kind = "p"
+        if cls == 0:
+            n = x[q]; kind = x[q + 1:q + 1 + n].decode("latin1"); q += 1 + n
+        k = "".join(_KINDS.get(c, "?") for c in kind)
+        if "?" in k or len(k) != 1:
+            raise FormatError(f"Parasolid field type « {kind} » not known")
+        kinds.append((k, count))
+    var = x[q]; q += 1
+    if var and kinds:
+        last, _count = kinds.pop()
+        return ("".join(k * max(c, 1) for k, c in kinds), last), q
+    return ("".join(k * max(c, 1) for k, c in kinds), ""), q
+
+
+def _plan(t, tokens):
+    """How to read the fields of node type t in a stream whose mark is tokens: [(kinds to read, place in LAYOUT or None)];
+    None when the stream uses the LAYOUT order as it is."""
+    lay = LAYOUT[t]
+    slots = len(lay) + (1 if t in VAR else 0)   # the variable part of a node counts as its last field
+    ref = V28[t].split() if t in V28 else []
+    place, b, j = {}, 0, 0
+    for tok in ref:
+        if tok == "C":
+            place[("b", b)] = j; b += 1; j += 1
+        elif tok == "D":
+            b += 1
+        else:
+            place[("n", tok)] = j; j += 1
+    while j < slots:   # a mark stops after its last change: the base fields that follow are kept
+        place[("b", b)] = j; b += 1; j += 1
+    nbase = b
+    if tokens is None:
+        tokens = []
+    names = [tk if isinstance(tk, str) else tk[0] for tk in tokens]
+    while names and names[-1] == "C":
+        names.pop()
+    short = list(ref)
+    while short and short[-1] == "C":
+        short.pop()
+    if names == short:
+        return None
+    plan, b = [], 0
+    for tok in list(tokens) + ["C"] * nbase:   # (the trailing base fields; the loop stops when they are all read)
+        if tok == "C":
+            if b >= nbase:
+                break
+            pos = place.get(("b", b)); b += 1
+            if pos is None:
+                raise FormatError(f"Parasolid node type {t}: field of the base schema not known")
+            plan.append((lay[pos] if pos < len(lay) else "", pos))
+        elif tok == "D":
+            b += 1
+        else:
+            name, kind, count = tok
+            kinds = "".join(_KINDS.get(k, "?") for k in kind) * max(count, 1)
+            if "?" in kinds:
+                raise FormatError(f"Parasolid node type {t}: field type « {kind} » not known")
+            pos = place.get(("n", name))
+            plan.append((kinds, pos if pos is not None and len(kinds) == 1 else None))
+    return plan
 
 
 class Node:
@@ -179,30 +328,65 @@ def parse(x):
     if m < 0:
         raise FormatError("Parasolid schema not found")
     p = m + x[m - 1] + 6   # nom du schéma, puis 6 octets avant le 1er nœud (la partition)
-    seen, nodes = set(), {}
+    plans, nodes, declared = {}, {}, {}
     while p < len(x) - 4:
         t = struct.unpack_from(">H", x, p)[0]; q = p + 2
         if t == 1:
             break   # fin du flux
-        if t not in seen:
-            q = _schema(x, q); seen.add(t)
+        if t in declared or (t not in LAYOUT and x[q] != 0xFF):
+            if t not in declared:   # type the base schema does not have: the stream describes it in full
+                declared[t], q = _declare(x, q)
+            kinds, var = declared[t]
+            n = 0
+            if var:
+                n = struct.unpack_from(">I", x, q)[0]; q += 4
+            idx, q = _ptr(x, q)
+            for ch in kinds:
+                if ch == "p":
+                    _v, q = _ptr(x, q)
+                else:
+                    q += _SZ[ch]
+            for _k in range(n if var == "p" else 0):
+                _v, q = _ptr(x, q)
+            if var and var != "p":
+                q += n * _SZ[var]
+            if q > len(x):
+                raise FormatError("Parasolid stream cut short")
+            p = q   # (nothing of these nodes is used yet)
+            continue
         lay = LAYOUT.get(t)
         if lay is None:
             raise FormatError(f"Parasolid node type {t} not supported yet (at byte {p})")
+        if t not in plans:
+            tokens, q = _mark(x, q)
+            plans[t] = _plan(t, tokens)
+        plan = plans[t]
         n = None
         el = VAR.get(t)
         if el:
             n = struct.unpack_from(">I", x, q)[0]; q += 4
         idx, q = _ptr(x, q)
         start = q
-        f = []
-        for ch in lay:
-            if ch == "p":
-                v, q = _ptr(x, q)
-                f.append(v)
-            else:
-                v = struct.unpack_from(_FMT[ch], x, q); q += _SZ[ch]
-                f.append(v if ch == "v" else v[0])
+        if plan is None:
+            f = []
+            for ch in lay:
+                if ch == "p":
+                    v, q = _ptr(x, q)
+                    f.append(v)
+                else:
+                    v = struct.unpack_from(_FMT[ch], x, q); q += _SZ[ch]
+                    f.append(v if ch == "v" else v[0])
+        else:   # another version of the schema: fields read in its order, stored in the LAYOUT order
+            f = [_DEFAULT[ch] for ch in lay]
+            for kinds, pos in plan:
+                for ch in kinds:
+                    if ch == "p":
+                        v, q = _ptr(x, q)
+                    else:
+                        v = struct.unpack_from(_FMT[ch], x, q); q += _SZ[ch]
+                        v = v if ch == "v" else v[0]
+                    if pos is not None and pos < len(lay):
+                        f[pos] = v
         rawq = q
         if el == "p":
             items = []
@@ -211,7 +395,7 @@ def parse(x):
                 items.append(v)
             f.append(items)
         elif el:
-            q += n * {"v": 24, "f": 8, "c": 1, "d": 4, "n": 2}[el]
+            q += n * _ELT[el]
         nodes[idx] = Node(t, idx, f, x[rawq:q] if el and el != "p" else x[start:q])
         p = q
     # contrôle : les faces, boucles et fins doivent pointer vers des nœuds lus (sinon le flux a été mal lu)

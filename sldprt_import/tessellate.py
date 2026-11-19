@@ -12,14 +12,22 @@ from . import brep as B
 
 
 class FaceMesh:
-    __slots__ = ("verts", "tris", "normals", "face", "body", "fallback")
+    __slots__ = ("verts", "tris", "normals", "face", "body", "fallback", "used")
 
     def __init__(self, face, body):
         self.verts, self.tris, self.normals, self.face, self.body, self.fallback = [], [], [], face, body, False
+        self.used = {}   # arête -> version de ses points utilisée par ce maillage
 
 
 def _sense(c):
     return -1 if c == b'-' else 1
+
+
+DEBUG = False
+GRID_ASPECT = 4       # une maille de la grille de départ est au plus 4 fois plus longue que large
+REFINE_ROUNDS = 6     # passes d'affinage d'une face (chaque passe coupe en deux les arêtes trop loin de la surface)
+REFINE_MAX = 60000    # points par face au plus
+EDGE_DEPTH = 7        # une arête de bord est coupée en deux au plus 7 fois (128 segments par segment de départ)
 
 
 class Mesher:
@@ -27,6 +35,9 @@ class Mesher:
         self.M, self.N, self.tol = model, model.N, tol
         self.max_edge = max_edge
         self.edges = {}
+        self.changed = {}    # arête -> nombre de fois où des points lui ont été ajoutés après coup
+        self._face_edges = ()
+        self._adj = None
         self.stats = {"faces": 0, "fallback": 0, "errors": []}
 
     # ------------------------------------------------------------ arêtes
@@ -63,7 +74,13 @@ class Mesher:
             if curve is None:
                 continue
             if isinstance(curve, B.Trimmed):   # courbe taillée : échantillonnée entre ses paramètres, si elle est cohérente
-                if a is None:
+                if a is None:   # arête sans sommet : le cercle entier de la courbe de base
+                    if getattr(curve.basis, 'periodic', None):
+                        pts = self._sample(curve.basis, None, None, self._curve_sense(e))
+                        curve = curve.basis
+                        if pts:
+                            break
+                        pts = None
                     continue
                 if curve.ok():
                     n = self._count(curve)
@@ -81,8 +98,82 @@ class Mesher:
             break
         if pts is None:
             pts = [a, b] if a is not None and b is not None else []
+        exact = isinstance(curve, (B.Line, B.Circle, B.Ellipse)) and pts is not None and len(pts) > 0   # déjà au pas de la tolérance
+        if not exact and len(pts) >= 2:
+            pts = self._refine_edge(ei, pts)
         self.edges[ei] = (pts, pos)
         return self.edges[ei]
+
+    def _adjacent(self, ei):
+        """Surfaces of the faces that share edge ei."""
+        if self._adj is None:
+            self._adj = {}
+            for face in self.M.faces():
+                surf = self.M.surface(face.f[7])
+                if surf is None:
+                    continue
+                for fins in self.M.loops(face):
+                    for fn in fins:
+                        e = self.N[fn].f[6]
+                        lst = self._adj.setdefault(e, [])
+                        if surf not in lst:
+                            lst.append(surf)
+        return self._adj.get(ei, [])
+
+    def _on_surfaces(self, p, surfs, hints):
+        """p brought onto the surfaces (their intersection when there are two) by alternate projections; hints: for each
+        surface the (u, v) of a point nearby, or None. Returns (point, the new (u, v) of each surface)."""
+        q, uv = p, list(hints)
+        for _ in range(2 if len(surfs) > 1 else 1):
+            for k, s in enumerate(surfs):
+                uv[k] = s.project(q, uv[k]) if getattr(s, 'hint', False) else s.project(q)
+                q = s.eval(*uv[k])
+        return q, uv
+
+    def _refine_edge(self, ei, pts):
+        """Boundary edge given by a few points (chart of an intersection, spline): points added where the straight segments
+        leave the surfaces of the two faces by more than the tolerance. The same points serve both faces: no gap."""
+        surfs = [s for s in self._adjacent(ei) if getattr(s, 'refine', True)]   # (congés : trop coûteux, l'autre face suffit)
+        if all(isinstance(s, B.Plane) for s in surfs):   # between flat faces: straight
+            return pts
+        ring = pts[-1] is None
+        base = pts[:-1] if ring else pts
+        tol = self.tol
+
+        def split(a, b, ha, hb, depth):
+            L2 = sum((a[c] - b[c]) ** 2 for c in range(3))
+            if depth >= EDGE_DEPTH or L2 < 16 * tol * tol:
+                return []
+            m = [(a[c] + b[c]) / 2 for c in range(3)]
+            hm = [None if x is None or y is None else ((x[0] + y[0]) / 2, (x[1] + y[1]) / 2) for x, y in zip(ha, hb)]
+            try:
+                q, hq = self._on_surfaces(m, surfs, hm)
+            except Exception:   # noqa: BLE001 — projection impossible : segment laissé droit
+                return []
+            d2 = sum((q[c] - m[c]) ** 2 for c in range(3))
+            if d2 <= tol * tol or d2 > 0.0625 * L2:   # dans la tolérance, ou projection partie ailleurs
+                return []
+            t = sum((q[c] - a[c]) * (b[c] - a[c]) for c in range(3)) / L2
+            if not 0.25 < t < 0.75:   # point qui glisse le long de l'arête (deux faces tangentes) : il sortirait de l'ordre
+                return []
+            return split(a, q, ha, hq, depth + 1) + [list(q)] + split(q, b, hq, hb, depth + 1)
+
+        def where(pt):   # (u, v) of a point of the edge on each spline surface (the others need no hint)
+            return [s.project(pt) if getattr(s, 'hint', False) and pt is not None else None for s in surfs]
+        out = []
+        n = len(base)
+        try:
+            hs = [where(pt) for pt in base]
+        except Exception:   # noqa: BLE001
+            return pts
+        for k in range(n if ring else n - 1):
+            a, b = base[k], base[(k + 1) % n]
+            out.append(a)
+            if a is not None and b is not None:
+                out += split(a, b, hs[k], hs[(k + 1) % n], 0)
+        if not ring:
+            out.append(base[-1])
+        return out + ([None] if ring else [])
 
     def _sample(self, c, a, b, csense):
         tol = self.tol
@@ -97,6 +188,13 @@ class Mesher:
                 n = max(8, int(math.ceil(per / c.step(tol))))
                 ts = [k * per / n * csense for k in range(n)]
                 return [c.eval(t) for t in ts] + [None]   # None : boucle fermée
+            if isinstance(c, B.Polyline) and len(c.pts) > 3 and B.length(B.sub(c.pts[0], c.pts[-1])) < 1e-7:   # tracé refermé
+                ring = [list(q) for q in c.pts[:-1]]
+                return (ring if csense > 0 else ring[::-1]) + [None]
+            if hasattr(c, 't0') and B.length(B.sub(c.eval(c.t0), c.eval(c.t1))) < 1e-7:   # spline refermée
+                n = max(16, int(math.ceil((c.t1 - c.t0) / (c.step(tol) or (c.t1 - c.t0) / 16))))
+                ring = [c.eval(c.t0 + (c.t1 - c.t0) * k / n) for k in range(n)]
+                return (ring if csense > 0 else ring[::-1]) + [None]
             return []
         ta = c.project(a)
         tb = c.project(b) if not closed else ta
@@ -167,9 +265,11 @@ class Mesher:
 
     # ------------------------------------------------------------ faces
 
-    def mesh_face(self, face):
+    def mesh_face(self, face, other_side=False):
+        """Mesh of one face; other_side: on a ring of a surface periodic both ways (torus), take the other band between its two
+        boundary circles (the two are possible and only the stored mesh tells which is right)."""
         try:
-            return self._mesh_face(face)
+            return self._mesh_face(face, other_side)
         except Exception as e:   # noqa: BLE001 — une face qui échoue ne doit pas arrêter l'import
             self.stats["errors"].append((face.index, "face", f"{type(e).__name__}: {e}"))
             self.stats["fallback"] += 1
@@ -177,29 +277,80 @@ class Mesher:
             fm.fallback = True
             return fm
 
-    def _mesh_face(self, face):
-        fm = FaceMesh(face.index, self.M.body_of(face))
-        surf = self.M.surface(face.f[7])
-        loops = [self.loop_points(fins) for fins in self.M.loops(face)]
-        loops = [l for l in loops if len(l) >= 2]
+    def _mesh_face(self, face, other_side=False):
         self.stats["faces"] += 1
-        if not loops:
+        surf = self.M.surface(face.f[7])
+        self._face_edges = [self.N[fn].f[6] for fins in self.M.loops(face) for fn in fins if self.N[fn].f[6] in self.N]
+        for attempt in range(6):
+            fm = FaceMesh(face.index, self.M.body_of(face))
+            loops = [self.loop_points(fins) for fins in self.M.loops(face)]
+            loops = [l for l in loops if len(l) >= 2]
+            fm.used = {e: self.changed.get(e, 0) for e in self._face_edges}
+            if not loops:
+                return fm
+            fsense = _sense(face.f[8]) * self._surf_sense(face.f[7])
+            try:
+                if surf is None:
+                    raise B.GeomError("surface not supported")
+                self._cdt(fm, surf, loops, fsense, other_side, split=attempt < 5)
+            except _Split:   # bords recoupés : la face est refaite avec les nouveaux points
+                continue
+            except Exception as e:   # noqa: BLE001 — repli : face plane au mieux
+                self.stats["errors"].append((face.index, self.N[face.f[7]].name, f"{type(e).__name__}: {e}"))
+                self._fallback(fm, loops, fsense)
             return fm
-        fsense = _sense(face.f[8]) * self._surf_sense(face.f[7])
-        try:
-            if surf is None:
-                raise B.GeomError("surface not supported")
-            self._cdt(fm, surf, loops, fsense)
-        except Exception as e:   # noqa: BLE001 — repli : face plane au mieux
-            self.stats["errors"].append((face.index, self.N[face.f[7]].name, f"{type(e).__name__}: {e}"))
-            self._fallback(fm, loops, fsense)
         return fm
+
+    def stale(self, fm):
+        """True when one of the edges of this face mesh got more points afterwards (for a neighbour): to mesh again."""
+        return any(self.changed.get(e, 0) != v for e, v in fm.used.items())
+
+    def _split_chords(self, chords):
+        """Boundary chords that cross another one in the face's (u, v) (two arcs meeting at a sharp corner, a chord cutting
+        across the next edge): each is cut at its middle brought back onto the curve, for both faces of the edge.
+        chords: pairs of 3D points. Returns True when an edge got a point."""
+        K = lambda p: (round(p[0] * 1e8), round(p[1] * 1e8), round(p[2] * 1e8))
+        done = False
+        for a, b in chords:
+            ka, kb = K(a), K(b)
+            for ei in self._face_edges:
+                if ei not in self.edges:
+                    continue
+                pts, pos = self.edges[ei]
+                ring = bool(pts) and pts[-1] is None
+                base = pts[:-1] if ring else pts
+                ks = [K(p) for p in base]
+                n = len(ks)
+                hit = next((k for k in range(n if ring else n - 1) if {ks[k], ks[(k + 1) % n]} == {ka, kb}), None)
+                if hit is None:
+                    continue
+                p, q = base[hit], base[(hit + 1) % n]
+                L = B.length(B.sub(p, q))
+                if L < 0.5 * self.tol or self.changed.get(ei, 0) >= 8:   # déjà court ou déjà recoupée souvent : le croisement
+                    break                                                 # vient d'ailleurs (projection en (u, v) dégénérée)
+                mid = [(p[c] + q[c]) / 2 for c in range(3)]
+                surfs = self._adjacent(ei)
+                try:
+                    m, _uv = self._on_surfaces(mid, surfs, [None] * len(surfs))
+                    m = list(m)
+                except Exception:   # noqa: BLE001
+                    break
+                if B.length(B.sub(m, mid)) > 0.5 * L:   # projection partie ailleurs
+                    break
+                base = base[:hit + 1] + [m] + base[hit + 1:]
+                self.edges[ei] = (base + ([None] if ring else []), pos)
+                self.changed[ei] = self.changed.get(ei, 0) + 1
+                done = True
+                break
+        return done
 
     def _surf_sense(self, si):
         n = self.N.get(si)
         return _sense(n.f[6]) if n is not None and n.f and isinstance(n.f[6], bytes) else 1
 
-    def _cdt(self, fm, surf, loops, fsense):
+    def _cdt(self, fm, surf, loops, fsense, other_side=False, split=False):
+        if isinstance(surf, B.Sphere) and len(loops) == 1 and len(loops[0]) >= 3:
+            surf = self._cap(surf, loops[0], fsense, other_side)
         pu, pv = getattr(surf, 'per_u', None), getattr(surf, 'per_v', None)
         uvl = []
         for l in loops:
@@ -259,11 +410,16 @@ class Mesher:
             others = [k for k, w in enumerate(winding) if not w[i]]
             s = uvl[wl[0]][0][i]
             chains = []
-            for k in wl:
-                c3, c2 = _cut(loops[k], uvl[k], i, s, per, surf)
+            for k in wl:   # coupée sur un de ses propres points (le plus près de la couture) : aucun point ajouté sur l'arête,
+                sk = min((B.wrap(q[i], s, per) for q in uvl[k]), key=lambda c: abs(c - s))   # qui reste celle de la face voisine
+                c3, c2 = _cut(loops[k], uvl[k], i, sk, per, surf)
                 chains.append((c3, c2))
             if len(chains) == 2:
                 (a3, a2), (b3, b2) = chains
+                pj = pu if j == 0 else pv
+                if other_side and pj:   # band between the two circles going round the other way
+                    sh = -pj if sum(p[j] for p in b2) / len(b2) > sum(p[j] for p in a2) / len(a2) else pj
+                    b2 = [[p[0] + (sh if j == 0 else 0), p[1] + (sh if j == 1 else 0)] for p in b2]
                 ring3 = a3 + list(reversed(b3))
                 ring2 = a2 + list(reversed(b2))
             elif len(chains) == 1:   # calotte : fermée par le pôle (ligne v = ±pi r)
@@ -299,6 +455,8 @@ class Mesher:
         if su or sv:
             su = su or (box[1] - box[0])
             sv = sv or (box[3] - box[2])
+            if not isinstance(surf, (B.Cylinder, B.Cone)):   # (droites le long de l'axe : une rangée suffit)
+                su, sv = min(su, GRID_ASPECT * sv), min(sv, GRID_ASPECT * su)   # mailles pas trop allongées : sinon des diagonales qui coupent la courbure
             su = max(su, (box[1] - box[0]) / 300, 1e-7)
             sv = max(sv, (box[3] - box[2]) / 300, 1e-7)
             if su < box[1] - box[0] or sv < box[3] - box[2]:
@@ -321,19 +479,94 @@ class Mesher:
         for poly in polys:
             edges += [(poly[k], poly[(k + 1) % len(poly)]) for k in range(len(poly))]
         span = max(box[1] - box[0], box[3] - box[2], 1e-9)
-        out = delaunay_2d_cdt([Vector(p) for p in pts2], edges, polys, 1, span * 1e-9, True)
-        overts, ofaces, orig = out[0], out[2], out[3]
         inside = _Inside([[pts2[k] for k in poly] for poly in polys])   # trous et concavités retirés ici (le mode 3 varie selon la version)
-        ofaces = [f for f in ofaces if inside(sum(overts[k].x for k in f) / len(f), sum(overts[k].y for k in f) / len(f))]
+        known = {}   # point 3D de chaque point (u, v) : celui du bord quand c'est un point du bord, sinon la surface
+
+        def at(k, ov, orig):
+            key = (ov.x, ov.y)
+            if key not in known:
+                src = [o for o in orig[k] if o < len(pts3)]
+                known[key] = list(pts3[src[0]]) if src and pts3[src[0]] is not None else list(surf.eval(ov.x, ov.y))
+            return known[key]
+
+        tol2 = self.tol * self.tol
+        good = set()
+        # (u, v) recentrés quand la face est loin de l'origine devant sa taille (voir plus bas) ; sinon tels quels : avant Blender 5.2
+        # la triangulation donne d'autres résultats sur des points déplacés
+        ox, oy = (box[0] + box[1]) / 2, (box[2] + box[3]) / 2
+        if max(abs(ox), abs(oy)) < 100 * max(box[1] - box[0], box[3] - box[2], 1e-9):
+            ox = oy = 0.0
+        if split:   # bord qui se recoupe en (u, v) (cordes de deux arcs qui se touchent dans un angle aigu) : recoupé avant
+            bad = _crossings(pts2, polys, min(0.05 * self.tol, 1e-3 * span))
+            chords = [(pts3[x], pts3[y]) for x, y in bad if pts3[x] is not None and pts3[y] is not None]
+            if chords and self._split_chords(chords):
+                raise _Split()
+        for rnd in range(REFINE_ROUNDS + 1):
+            # (u, v) ramenés près de 0 : les Vector sont en simple précision, et loin de l'origine (plan à 20 m) des points
+            # voisins d'un bord presque droit se confondaient — triangles plats écartés, points du bord perdus, fentes
+            out = delaunay_2d_cdt([Vector((p[0] - ox, p[1] - oy)) for p in pts2], edges, polys, 1, span * 1e-9, True)
+            ofaces, orig = out[2], out[3]
+            if rnd == 0 and split:
+                # points créés par le maillage sur un bord (deux cordes du bord qui se croisent) : la face voisine ne les a
+                # pas, ce serait une fente ; on recoupe ces cordes et on recommence
+                crossed = [k for k, o in enumerate(orig) if not any(i < len(pts2) for i in o)]
+                if crossed:
+                    bad = set(crossed)
+                    chords = []
+                    for (i, j), oe in zip(out[1], out[4]):
+                        if (i in bad or j in bad) and oe:
+                            for ie in oe:
+                                if ie < len(edges):
+                                    x, y = edges[ie]
+                                    if pts3[x] is not None and pts3[y] is not None:
+                                        chords.append((pts3[x], pts3[y]))
+                    if chords and self._split_chords(chords):
+                        raise _Split()
+            overts = [_UV(pts2[o[0]] if o and o[0] < len(pts2) else (v.x + ox, v.y + oy)) for v, o in zip(out[0], orig)]
+            ofaces = [f for f in ofaces if inside(sum(overts[k].x for k in f) / len(f), sum(overts[k].y for k in f) / len(f))]
+            if rnd == REFINE_ROUNDS or len(pts2) > REFINE_MAX or not getattr(surf, 'refine', True):
+                break
+            # arêtes intérieures dont le milieu s'écarte de la surface de plus que la tolérance : un point de plus au milieu
+            count = {}
+            for f in ofaces:
+                for t in range(len(f)):
+                    e = (f[t], f[(t + 1) % len(f)])
+                    e = e if e[0] < e[1] else (e[1], e[0])
+                    count[e] = count.get(e, 0) + 1
+            more, worst = [], []
+            for (i, j), n in count.items():
+                if n < 2:   # bord de la face : ses points viennent de l'arête, partagée avec la face voisine
+                    continue
+                a, b = overts[i], overts[j]
+                ek = (a.x, a.y, b.x, b.y) if (a.x, a.y) < (b.x, b.y) else (b.x, b.y, a.x, a.y)
+                if ek in good:   # déjà dans la tolérance à une passe précédente
+                    continue
+                pa, pb = at(i, a, orig), at(j, b, orig)
+                um, vm = (a.x + b.x) / 2, (a.y + b.y) / 2
+                q = surf.eval(um, vm)
+                d2 = sum((q[c] - (pa[c] + pb[c]) / 2) ** 2 for c in range(3))
+                if d2 <= tol2:
+                    good.add(ek)
+                elif d2 < 0.25 * sum((pa[c] - pb[c]) ** 2 for c in range(3)):   # (écart absurde : projection ratée, on n'insiste pas)
+                    more.append([um, vm])
+                    if DEBUG:
+                        worst.append(d2 ** 0.5)
+                        if d2 > 2.5e-5 and len(worst) < 400 and rnd >= 4:
+                            print('   DEBUG arête', (round(a.x, 5), round(a.y, 4)), (round(b.x, 5), round(b.y, 4)), 'L mm', round(sum((pa[c] - pb[c]) ** 2 for c in range(3)) ** 0.5 * 1000, 1), 'pa', [round(x * 1000) for x in pa], 'surf(a)', [round(x * 1000) for x in surf.eval(a.x, a.y)], 'orig', orig[i][:3], len(pts3))
+                    known[(um, vm)] = list(q)
+            if DEBUG:
+                print('  DEBUG passe', rnd, 'points', len(pts2), 'ajouts', len(more), 'pire écart mm', round(max([0.0] + worst) * 1000, 4))
+            if not more:
+                break
+            pts2 += more
+            pts3 += [None] * len(more)
         used = {k for f in ofaces for k in f}   # seuls les sommets des triangles gardés (pas les points hors de la face)
         remap = {}
         for k, ov in enumerate(overts):
             if k not in used:
                 continue
-            src = [o for o in orig[k] if o < len(pts3)]
-            p3 = pts3[src[0]] if src and pts3[src[0]] is not None else surf.eval(ov.x, ov.y)
             remap[k] = len(fm.verts)
-            fm.verts.append(list(p3))
+            fm.verts.append(at(k, ov, orig))
             fm.normals.append(B.mul(surf.normal(ov.x, ov.y), fsense))
         for f in ofaces:
             for t in range(1, len(f) - 1):
@@ -343,11 +576,32 @@ class Mesher:
                 ref = B.add(B.add(fm.normals[a], fm.normals[b]), fm.normals[c])
                 fm.tris.append((a, b, c) if B.dot(nrm, ref) >= 0 else (a, c, b))
 
+    def _cap(self, surf, loop, fsense, other_side):
+        """Sphere face inside one loop: the same sphere with its axis through the middle of the face, so that the loop goes
+        round the axis and the face is the cap at the top. The side is the one on the left of the loop seen from outside the
+        face (the loop of a face runs anticlockwise around it)."""
+        w = [0.0, 0.0, 0.0]
+        n = len(loop)
+        for k in range(n):
+            w = B.add(w, B.cross(B.sub(loop[k], surf.c), B.sub(loop[(k + 1) % n], surf.c)))
+        if B.length(w) < 1e-18:
+            return surf
+        side = fsense * surf.sign * (-1.0 if other_side else 1.0)
+        a = B.mul(B.unit(w), side)
+        x = B.unit(B.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0]))
+        cap = B.Sphere(surf.c, surf.r, a, x)
+        cap.sign, cap.top = surf.sign, True
+        return cap
+
     def _pole(self, surf, chain2, j, fsense):
+        if isinstance(surf, B.Sphere) and getattr(surf, 'top', False):
+            return math.pi / 2 * surf.r
         if isinstance(surf, B.Sphere):
             half = math.pi / 2 * surf.r
             m = sum(p[j] for p in chain2) / len(chain2)
             return half if m >= 0 else -half
+        if isinstance(surf, B.Cone) and j == 1 and abs(surf.k) > 1e-12:   # pointe du cône : rayon nul
+            return -surf.r / surf.k
         raise B.GeomError("single wrapping loop on a surface without pole")
 
     def _fallback(self, fm, loops, fsense):
@@ -366,9 +620,10 @@ class Mesher:
         x = B.unit(B.cross(n, [1, 0, 0] if abs(n[0]) < 0.9 else [0, 1, 0]))
         y = B.cross(n, x)
         pts2, polys = [], []
+        o = allp[0]   # près de 0 (simple précision des Vector)
         for l in loops:
             base = len(pts2)
-            pts2 += [Vector((B.dot(p, x), B.dot(p, y))) for p in l]
+            pts2 += [Vector((B.dot(B.sub(p, o), x), B.dot(B.sub(p, o), y))) for p in l]
             polys.append(list(range(base, base + len(l))))
         edges = [(poly[k], poly[(k + 1) % len(poly)]) for poly in polys for k in range(len(poly))]
         try:
@@ -384,7 +639,7 @@ class Mesher:
                 continue
             src = [o for o in out[3][k] if o < len(allp)]
             remap[k] = len(fm.verts)
-            fm.verts.append(list(allp[src[0]]) if src else B.add(B.mul(x, ov.x), B.mul(y, ov.y)))
+            fm.verts.append(list(allp[src[0]]) if src else B.add(o, B.add(B.mul(x, ov.x), B.mul(y, ov.y))))
             fm.normals.append(n)
         for f in out[2]:
             for t in range(1, len(f) - 1):
@@ -392,6 +647,18 @@ class Mesher:
 
     def mesh_all(self):
         return [self.mesh_face(f) for f in self.M.faces()]
+
+
+class _Split(Exception):
+    """Raised when boundary chords were cut: the face is meshed again."""
+
+
+class _UV:
+    """A CDT output point back in the face's (u, v), in double precision."""
+    __slots__ = ("x", "y")
+
+    def __init__(self, p):
+        self.x, self.y = p[0], p[1]
 
 
 class _Inside:
@@ -424,6 +691,53 @@ class _Inside:
         return inside
 
 
+def _crossings(pts, polys, eps):
+    """Boundary segments (pairs of point indices) that cross or touch a segment not next to them (closer than eps)."""
+    segs = [(poly[k], poly[(k + 1) % len(poly)]) for poly in polys for k in range(len(poly))]
+    if len(segs) < 4:
+        return []
+    L = sum(math.hypot(pts[b][0] - pts[a][0], pts[b][1] - pts[a][1]) for a, b in segs) / len(segs)
+    cell = max(L, eps * 4, 1e-12)
+    grid = {}
+    for n, (a, b) in enumerate(segs):
+        (x0, x1), (y0, y1) = sorted((pts[a][0], pts[b][0])), sorted((pts[a][1], pts[b][1]))
+        i0, i1, j0, j1 = int((x0 - eps) // cell), int((x1 + eps) // cell), int((y0 - eps) // cell), int((y1 + eps) // cell)
+        if (i1 - i0 + 1) * (j1 - j0 + 1) > 400:   # segment très long devant les autres : cases grossières
+            i0, i1, j0, j1 = i0, min(i1, i0 + 19), j0, min(j1, j0 + 19)
+        for i in range(i0, i1 + 1):
+            for j in range(j0, j1 + 1):
+                grid.setdefault((i, j), []).append(n)
+
+    def dist(p, a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        d2 = dx * dx + dy * dy
+        t = 0.0 if d2 == 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / d2))
+        return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy)
+
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    out, seen = set(), set()
+    for lst in grid.values():
+        for x in range(len(lst)):
+            for y in range(x + 1, len(lst)):
+                m, n = lst[x], lst[y]
+                if (m, n) in seen:
+                    continue
+                seen.add((m, n))
+                (a, b), (c, d) = segs[m], segs[n]
+                if len({a, b, c, d}) < 4:   # segments qui se suivent
+                    continue
+                pa, pb, pc, pd = pts[a], pts[b], pts[c], pts[d]
+                # deux segments qui partagent un bout (point de couture ou de pôle en double) ne se touchent pas : seul un
+                # vrai croisement compte alors
+                shared = min(math.hypot(p[0] - q[0], p[1] - q[1]) for p in (pa, pb) for q in (pc, pd)) < eps
+                if (orient(pa, pb, pc) * orient(pa, pb, pd) < 0 and orient(pc, pd, pa) * orient(pc, pd, pb) < 0) or \
+                        (not shared and min(dist(pc, pa, pb), dist(pd, pa, pb), dist(pa, pc, pd), dist(pb, pc, pd)) < eps):
+                    out.add(segs[m])
+                    out.add(segs[n])
+    return sorted(out)
+
+
 def _area(uv):
     a = 0.0
     for k in range(len(uv)):
@@ -454,10 +768,14 @@ def _cut(pts3, uv, i, s, per, surf):
         a, b = seq2[k], seq2[k + 1]
         if (a[i] - target) * (b[i] - target) <= 0 and a[i] != b[i]:
             f = (target - a[i]) / (b[i] - a[i])
+            if f >= 1 - 1e-9:   # la couture passe par le point suivant : coupée sur ce point même (un point recalculé
+                k = (k + 1) % n  # différerait de l'arrondi près : la face voisine ne l'aurait pas)
+                a = seq2[k]
+                f = 0.0
             c2 = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]
             c2[i] = target
             c3 = B.lerp(seq3[k], seq3[k + 1], f)
-            if f <= 1e-12:
+            if f <= 1e-9:
                 c3, c2 = seq3[k], [a[0], a[1]]
                 c2[i] = target
                 chain2 = seq2[k + 1:-1] + seq2[:k + 1]

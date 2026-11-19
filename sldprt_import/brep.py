@@ -60,6 +60,12 @@ class Nurbs:
 
     @staticmethod
     def basis(U, p, i, t):
+        if p == 1:   # ruled direction: two weights
+            den = U[i + 1] - U[i]
+            if den == 0:
+                return [1.0, 0.0]
+            w = (t - U[i]) / den
+            return [1.0 - w, w]
         N = [1.0] + [0.0] * p
         left, right = [0.0] * (p + 1), [0.0] * (p + 1)
         for j in range(1, p + 1):
@@ -73,6 +79,21 @@ class Nurbs:
                 saved = left[j - r] * tmp
             N[j] = saved
         return N
+
+    @staticmethod
+    def basis_d(U, p, i, t):
+        """Basis functions at t and their first derivatives."""
+        N = Nurbs.basis(U, p, i, t)
+        if p == 0:
+            return N, [0.0]
+        M = Nurbs.basis(U, p - 1, i, t)   # N_{i-p+1 .. i, p-1}
+        d = [0.0] * (p + 1)
+        for r in range(p + 1):
+            k = i - p + r
+            a = M[r - 1] / (U[k + p] - U[k]) if r >= 1 and U[k + p] != U[k] else 0.0
+            b = M[r] / (U[k + p + 1] - U[k + 1]) if r < p and U[k + p + 1] != U[k + 1] else 0.0
+            d[r] = p * (a - b)
+        return N, d
 
 
 class NurbsCurve:
@@ -101,8 +122,8 @@ class NurbsCurve:
             m = max(32, self.n * 8)
             ts = [self.t0 + (self.t1 - self.t0) * k / m for k in range(m + 1)]
             self._samples = [(t, self.eval(t)) for t in ts]
-        best = min(self._samples, key=lambda s: sum((s[1][d] - pt[d]) ** 2 for d in range(len(pt))))
-        t = best[0]
+            self._near = _Samples([(t, 0.0, (q + [0.0, 0.0])[:3]) for t, q in self._samples])   # (2D curves: z = 0)
+        t = self._near.nearest((list(pt) + [0.0, 0.0])[:3], 1)[0][0]
         h = (self.t1 - self.t0) / (len(self._samples) - 1)
         for _ in range(40):   # recherche dorée autour du meilleur échantillon
             a, b = max(self.t0, t - h), min(self.t1, t + h)
@@ -120,27 +141,52 @@ class NurbsCurve:
 
 
 class NurbsSurface:
+    per_u = per_v = None
+    hint = True   # project() accepts the (u, v) of a point nearby
+
     def __init__(self, du, dv, U, V, grid, rational):
         self.pu, self.pv, self.U, self.V, self.grid, self.rat = du, dv, U, V, grid, rational
         self.nu, self.nv = len(grid), len(grid[0])
         self.u0, self.u1, self.v0, self.v1 = U[du], U[self.nu], V[dv], V[self.nv]
         self._samp = None
-        # échelle : longueur moyenne d'une ligne iso, pour un (u, v) à peu près en mètres
-        self.su = self._len(True) / max(self.u1 - self.u0, 1e-12)
-        self.sv = self._len(False) / max(self.v1 - self.v0, 1e-12)
+        # (u, v) en mètres le long de la surface : abscisse curviligne moyenne des lignes iso, mesurée travée par travée
+        # (un paramétrage très irrégulier, 80 % de la longueur dans 0,1 % du paramètre, donnait des triangles en aiguille)
+        self._mu = self._arc(True)
+        self._mv = self._arc(False)
+        self.su = self._mu[1][-1] / max(self.u1 - self.u0, 1e-12)   # échelles moyennes (information)
+        self.sv = self._mv[1][-1] / max(self.v1 - self.v0, 1e-12)
+        # surface refermée sur elle-même (anneau, tube) : périodique, sinon un point de la couture se projette à l'autre bout
+        fr = (0.1, 0.5, 0.9)
+        size = max(self._mu[1][-1], self._mv[1][-1])
+        if all(length(sub(self.raw(self.u0, self.v0 + (self.v1 - self.v0) * f), self.raw(self.u1, self.v0 + (self.v1 - self.v0) * f))) < 1e-6 * size for f in fr):
+            self.per_u = self._mu[1][-1]
+        if all(length(sub(self.raw(self.u0 + (self.u1 - self.u0) * f, self.v0), self.raw(self.u0 + (self.u1 - self.u0) * f, self.v1))) < 1e-6 * size for f in fr):
+            self.per_v = self._mv[1][-1]
 
-    def _len(self, along_u):
-        tot = 0.0
-        for f in (0.25, 0.5, 0.75):
-            prev = None
-            for k in range(9):
-                s = k / 8
-                p = self.raw(self.u0 + (self.u1 - self.u0) * s, self.v0 + (self.v1 - self.v0) * f) if along_u else \
-                    self.raw(self.u0 + (self.u1 - self.u0) * f, self.v0 + (self.v1 - self.v0) * s)
-                if prev is not None:
-                    tot += length(sub(p, prev))
-                prev = p
-        return max(tot / 3, 1e-9)
+    def _arc(self, along_u):
+        """(parameters, lengths from the start): mean arc length of three iso lines, 4 samples per knot span."""
+        U, p, n = (self.U, self.pu, self.nu) if along_u else (self.V, self.pv, self.nv)
+        a, b = (self.u0, self.u1) if along_u else (self.v0, self.v1)
+        c, d = (self.v0, self.v1) if along_u else (self.u0, self.u1)
+        knots = sorted({k for k in U[p:n + 1] if a <= k <= b} | {a, b})
+        per = max(1, min(4, 400 // max(len(knots) - 1, 1)))
+        ts = []
+        for k0, k1 in zip(knots, knots[1:]):
+            ts += [k0 + (k1 - k0) * i / per for i in range(per)]
+        ts.append(b)
+        ss, prev = [0.0], None
+        for t in ts:
+            q = [self.raw(t, c + (d - c) * f) if along_u else self.raw(c + (d - c) * f, t) for f in (0.2, 0.5, 0.8)]
+            if prev is not None:
+                ss.append(ss[-1] + max(sum(length(sub(x, y)) for x, y in zip(q, prev)) / 3, 1e-12))
+            prev = q
+        return ts, ss
+
+    @staticmethod
+    def _map(xs, ys, x):
+        """Piecewise linear map xs -> ys (both increasing), extended beyond the ends."""
+        i = min(max(bisect.bisect_right(xs, x) - 1, 0), len(xs) - 2)
+        return ys[i] + (x - xs[i]) * (ys[i + 1] - ys[i]) / ((xs[i + 1] - xs[i]) or 1e-300)
 
     def raw(self, u, v):   # hors du domaine : le dernier polynôme est prolongé (Parasolid étend les surfaces)
         iu = Nurbs.span(self.U, self.pu, self.nu, u)
@@ -148,6 +194,20 @@ class NurbsSurface:
         Nu = Nurbs.basis(self.U, self.pu, iu, u)
         Nv = Nurbs.basis(self.V, self.pv, iv, v)
         dim = len(self.grid[0][0])
+        if dim == 3:   # the usual case, written out (this function is called millions of times)
+            x = y = z = 0.0
+            i0, j0, grid = iu - self.pu, iv - self.pv, self.grid
+            for a, na in enumerate(Nu):
+                if na == 0.0:
+                    continue
+                row = grid[i0 + a]
+                for b, nb in enumerate(Nv):
+                    w = na * nb
+                    c = row[j0 + b]
+                    x += w * c[0]
+                    y += w * c[1]
+                    z += w * c[2]
+            return [x, y, z]
         acc = [0.0] * dim
         for a in range(self.pu + 1):
             row = self.grid[iu - self.pu + a]
@@ -162,7 +222,44 @@ class NurbsSurface:
         return acc[:3]
 
     def eval(self, u, v):
-        return self.raw(u / self.su, v / self.sv)
+        if self.per_u:
+            u %= self.per_u
+        if self.per_v:
+            v %= self.per_v
+        return self.raw(self._map(self._mu[1], self._mu[0], u), self._map(self._mv[1], self._mv[0], v))
+
+    def native(self, u, v):
+        """Native parameters of the (u, v) in metres along the surface."""
+        if self.per_u:
+            u %= self.per_u
+        if self.per_v:
+            v %= self.per_v
+        return self._map(self._mu[1], self._mu[0], u), self._map(self._mv[1], self._mv[0], v)
+
+    def raw_d(self, u, v):
+        """Point and first derivatives along the native parameters."""
+        iu = Nurbs.span(self.U, self.pu, self.nu, u)
+        iv = Nurbs.span(self.V, self.pv, self.nv, v)
+        Nu, Du = Nurbs.basis_d(self.U, self.pu, iu, u)
+        Nv, Dv = Nurbs.basis_d(self.V, self.pv, iv, v)
+        dim = len(self.grid[0][0])
+        A, Au, Av = [0.0] * dim, [0.0] * dim, [0.0] * dim
+        i0, j0, grid = iu - self.pu, iv - self.pv, self.grid
+        for a in range(self.pu + 1):
+            row = grid[i0 + a]
+            na, da = Nu[a], Du[a]
+            for b in range(self.pv + 1):
+                c = row[j0 + b]
+                w, wu, wv = na * Nv[b], da * Nv[b], na * Dv[b]
+                for k in range(dim):
+                    A[k] += w * c[k]
+                    Au[k] += wu * c[k]
+                    Av[k] += wv * c[k]
+        if self.rat and dim == 4:
+            w = A[3] or 1.0
+            S = [A[k] / w for k in range(3)]
+            return S, [(Au[k] - Au[3] * S[k]) / w for k in range(3)], [(Av[k] - Av[3] * S[k]) / w for k in range(3)]
+        return A[:3], Au[:3], Av[:3]
 
     def normal(self, u, v):
         h = 1e-6
@@ -172,24 +269,87 @@ class NurbsSurface:
     def steps(self, tol, box):
         return _curv_step(self, tol, box)
 
-    def project(self, p):
-        if self._samp is None:   # grille de départ : environ 3 points par travée de nœuds
-            mu = min(max(3 * (self.nu - self.pu), 8), 90)
-            mv = min(max(3 * (self.nv - self.pv), 8), 90)
-            self._samp = [(self.u0 + (self.u1 - self.u0) * i / mu, self.v0 + (self.v1 - self.v0) * j / mv) for i in range(mu + 1) for j in range(mv + 1)]
-            self._samp = [(u, v, self.raw(u, v)) for u, v in self._samp]
+    def project(self, p, hint=None):
+        """(u, v) of the point of the surface nearest to p; hint: (u, v) of a point known to be close (one quick search)."""
         eu, ev = (self.u1 - self.u0) * 0.25, (self.v1 - self.v0) * 0.25
-        return _multi_newton(self.raw, p, self._samp, (self.u0 - eu, self.u1 + eu, self.v0 - ev, self.v1 + ev), (self.su, self.sv))
+        box = (self.u0 - eu, self.u1 + eu, self.v0 - ev, self.v1 + ev)
+        if hint is not None:
+            u, v = _newton(self.raw, p, self._map(self._mu[1], self._mu[0], hint[0]), self._map(self._mv[1], self._mv[0], hint[1]), box, it=12)
+        else:
+            if self._samp is None:   # grille de départ, régulière en longueur le long de la surface
+                mu = min(max(3 * (self.nu - self.pu), 8), 90)
+                mv = min(max(3 * (self.nv - self.pv), 8), 90)
+                us = [self._map(self._mu[1], self._mu[0], self._mu[1][-1] * i / mu) for i in range(mu + 1)]
+                vs = [self._map(self._mv[1], self._mv[0], self._mv[1][-1] * j / mv) for j in range(mv + 1)]
+                self._samp = _Samples([(u, v, self.raw(u, v)) for u in us for v in vs])
+            u, v = _multi_newton(self.raw, p, self._samp, box, (1.0, 1.0))
+        return self._map(self._mu[0], self._mu[1], u), self._map(self._mv[0], self._mv[1], v)
+
+
+class OffsetNurbs:
+    """Spline surface moved by d along its normal (skins with their thickness): the same (u, v) in metres as its base, so
+    the same regular sampling and projection (the nearest point of the base is the foot of the nearest point)."""
+    hint = True
+
+    def __init__(self, base, d):
+        self.base, self.d = base, d
+        self.per_u, self.per_v = base.per_u, base.per_v
+
+    def _at(self, u, v):
+        p, du, dv = self.base.raw_d(*self.base.native(u, v))
+        n = cross(du, dv)
+        L = length(n)
+        if L < 1e-300:   # point singulier (pôle) : normale par différences
+            n = self.base.normal(u, v)
+        else:
+            n = mul(n, 1.0 / L)
+        return p, n
+
+    def eval(self, u, v):
+        p, n = self._at(u, v)
+        return add(p, mul(n, self.d))
+
+    def normal(self, u, v):
+        return self._at(u, v)[1]
+
+    def project(self, p, hint=None):
+        return self.base.project(p, hint)
+
+    def steps(self, tol, box):
+        return _curv_step(self, tol, box)
+
+
+class _Samples:
+    """Start points of a projection: (u, v, point); the nearest ones to a point found at once (numpy when it is there)."""
+
+    def __init__(self, items):
+        self.items = items
+        try:
+            import numpy
+            self.np, self.xyz = numpy, numpy.array([q for _u, _v, q in items], dtype=float)
+        except ImportError:
+            self.np = self.xyz = None
+
+    def nearest(self, p, k):
+        if self.xyz is None:
+            return sorted(self.items, key=lambda e: (e[2][0] - p[0]) ** 2 + (e[2][1] - p[1]) ** 2 + (e[2][2] - p[2]) ** 2)[:k]
+        d = ((self.xyz - self.np.array(p[:3], dtype=float)) ** 2).sum(axis=1)
+        k = min(k, len(self.items))
+        idx = self.np.argpartition(d, k - 1)[:k] if k < len(self.items) else self.np.arange(len(self.items))
+        return [self.items[i] for i in sorted(idx.tolist(), key=lambda i: d[i])]
 
 
 def _multi_newton(f, p, samp, box, scale, starts=3):
     d2 = lambda q: (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2 + (q[2] - p[2]) ** 2
     best, bd = None, 1e300
-    for u, v, _q in sorted(samp, key=lambda e: d2(e[2]))[:starts]:
+    near = samp.nearest(p, starts) if isinstance(samp, _Samples) else sorted(samp, key=lambda e: d2(e[2]))[:starts]
+    for u, v, _q in near:
         uu, vv = _newton(f, p, u, v, box)
         d = d2(f(uu, vv))
         if d < bd:
             best, bd = (uu, vv), d
+        if bd < 1e-14:   # on the surface (0.1 µm): no need for the other starts
+            break
     return best[0] * scale[0], best[1] * scale[1]
 
 
@@ -376,6 +536,9 @@ class Cylinder:
         self.y = cross(self.a, self.x)
         self.per_u = 2 * math.pi * r
 
+    def raw(self, a, h):   # paramètres du fichier (courbes tracées sur la surface) : angle, hauteur
+        return self.eval(a * self.r, h)
+
     def eval(self, u, v):
         t = u / self.r
         return add(self.o, add(mul(self.a, v), add(mul(self.x, self.r * math.cos(t)), mul(self.y, self.r * math.sin(t)))))
@@ -429,6 +592,9 @@ class Sphere:
         self.y = cross(self.a, self.x)
         self.per_u = 2 * math.pi * r
 
+    def raw(self, a, b):   # paramètres du fichier : deux angles
+        return self.eval(a * self.r, b * self.r)
+
     def eval(self, u, v):
         t, f = u / self.r, v / self.r
         return add(self.c, mul(add(mul(self.a, math.sin(f)), mul(add(mul(self.x, math.cos(t)), mul(self.y, math.sin(t))), math.cos(f))), self.r))
@@ -438,7 +604,9 @@ class Sphere:
         h = dot(d, self.a)
         return math.atan2(dot(d, self.y), dot(d, self.x)) * self.r, math.asin(max(-1.0, min(1.0, h / max(length(d), 1e-300)))) * self.r
 
-    def normal(self, u, v): return unit(sub(self.eval(u, v), self.c))
+    sign = 1.0
+
+    def normal(self, u, v): return mul(unit(sub(self.eval(u, v), self.c)), self.sign)
     def steps(self, tol, box): s = _angle_step(self.r, tol) * self.r; return s, s
 
 
@@ -448,6 +616,9 @@ class Torus:
         self.y = cross(self.a, self.x)
         self.per_u = 2 * math.pi * max(R, 1e-9)
         self.per_v = 2 * math.pi * r
+
+    def raw(self, a, b):   # paramètres du fichier : deux angles (vérifié sur 91 arêtes)
+        return self.eval(a * max(self.R, 1e-9), b * self.r)
 
     def eval(self, u, v):
         t, f = u / max(self.R, 1e-9), v / self.r
@@ -478,7 +649,7 @@ class Generic:
         self.raw, self.box = raw, box
         s0, s1, t0, t1 = box
         self._samp = [(s0 + (s1 - s0) * i / samples, t0 + (t1 - t0) * j / samples) for i in range(samples + 1) for j in range(samples + 1)]
-        self._samp = [(s, t, raw(s, t)) for s, t in self._samp]
+        self._samp = _Samples([(s, t, raw(s, t)) for s, t in self._samp])
         def iso(along):
             tot = 0.0
             for f in (0.25, 0.5, 0.75):
@@ -558,6 +729,8 @@ class Spun:
         self.su = max(sum(length(sub(b, a)) for a, b in zip(pts, pts[1:])), 1e-9) / max(t1 - t0, 1e-12)
         self.rho = max(max(r for _t, (_h, r, _v) in self.samples), 1e-9)
         self.per_u, self.per_v = None, 2 * math.pi * self.rho
+        if isinstance(prof, Circle) or (hasattr(prof, 't0') and length(sub(pts[0], pts[-1])) < 1e-9):
+            self.per_u = (t1 - t0) * self.su   # closed profile (ring, torus-like): periodic along the profile too
 
     def _hr(self, q):
         d = sub(q, self.base)
@@ -566,6 +739,8 @@ class Spun:
         return h, length(rv), rv
 
     def raw(self, a, th):
+        if self.per_u:
+            a = self.t0 + (a - self.t0) % (self.t1 - self.t0)
         h, r, rv = self._hr(self.prof.eval(a))
         e1 = unit(rv) if r > 1e-12 else [0.0, 0.0, 0.0]
         e2 = cross(self.ax, e1)
@@ -605,6 +780,7 @@ class Blend:
 
     def __init__(self, spine, s1, s2, r):
         self.sp, self.s1, self.s2, self.r = spine, s1, s2, abs(r)
+        self._frames = {}
         pts = spine.pts
         self.su = max(sum(length(sub(b, a)) for a, b in zip(pts, pts[1:])) / max(len(pts) - 1, 1), 1e-9)
         if length(sub(pts[0], pts[-1])) < 1e-9:
@@ -617,9 +793,20 @@ class Blend:
     def _foot(self, s, c):
         return s.eval(*s.project(c))
 
+    refine = False   # each point costs many projections: meshed on its first grid, not refined
+
     def _frame(self, t):
         if self.sp.closed:
             t %= (len(self.sp.pts) - 1)
+        key = round(t, 9)
+        hit = self._frames.get(key)
+        if hit is None:
+            if len(self._frames) > 50000:
+                self._frames.clear()
+            hit = self._frames[key] = self._frame_at(t)
+        return hit
+
+    def _frame_at(self, t):
         c = self.sp.eval(t)
         i = min(max(int(math.floor(t)), 0), len(self.sp.pts) - 2)
         T = unit(sub(self.sp.pts[i + 1], self.sp.pts[i]))   # le centre reste dans le plan de la section
@@ -793,6 +980,8 @@ class Model:
                 s = Sphere(base.c, base.r + d, base.a, base.x)
             elif isinstance(base, Torus):
                 s = Torus(base.c, base.a, base.R, base.r + d, base.x)
+            elif isinstance(base, NurbsSurface):
+                s = OffsetNurbs(base, d)
             elif base is not None:
                 fb = base.raw if hasattr(base, 'raw') else base.eval
                 box = getattr(base, 'box', None)
@@ -819,9 +1008,29 @@ class Model:
             prof = self.curve(n.f[7])
             if prof is not None:
                 s = Spun(prof, n.f[8], n.f[9])
+                circ = prof.basis if isinstance(prof, Trimmed) else prof
+                if type(circ) is Circle:   # cercle centré sur l'axe et tourné autour d'un diamètre : une sphère (avec ses pôles)
+                    ax = unit(n.f[9])
+                    off = sub(circ.c, n.f[8])
+                    off = sub(off, mul(ax, dot(off, ax)))
+                    if length(off) < 1e-9 + 1e-7 * circ.r and abs(dot(circ.n, ax)) < 1e-7:
+                        sph = Sphere(circ.c, circ.r, ax, circ.n)
+                        try:   # même côté que la surface du fichier
+                            q = circ.eval(0.7)
+                            if dot(s.normal(*s.project(q)), sph.normal(*sph.project(q))) < 0:
+                                sph.sign = -1.0
+                        except (ZeroDivisionError, ValueError):
+                            pass
+                        s = sph
         elif t == 56:   # congé à bille roulante
             spine = self.curve(n.f[10])
             s1, s2 = self.surface(n.f[8]), self.surface(n.f[9])
+            if isinstance(spine, (Circle, Ellipse)):   # tracé du centre donné par une courbe exacte : mis en points, comme les autres
+                pts = [spine.eval(2 * math.pi * k / 96) for k in range(96)]
+                spine = Polyline(pts + [pts[0]])
+            elif isinstance(spine, NurbsCurve):
+                m = max(32, 4 * spine.n)
+                spine = Polyline([spine.eval(spine.t0 + (spine.t1 - spine.t0) * k / m)[:3] for k in range(m + 1)])
             if isinstance(spine, Polyline) and s1 is not None and s2 is not None and n.f[11] > UNSET:
                 s = Blend(spine, s1, s2, n.f[11])
         if s is not None and not hasattr(s, 'raw'):
